@@ -1,6 +1,6 @@
 """
 生产报工工资匹配计划单和订单分析工具 (Streamlit 网页版)
-
+修复版：Excel 中工资占比超阈值的高亮红色现在会正确生效
 """
 
 import streamlit as st
@@ -18,7 +18,7 @@ from openpyxl.styles import Alignment, PatternFill
 # 页面配置
 # ============================================================
 st.set_page_config(
-    page_title="生产报工工资匹配计划单和订单分析工具 ",
+    page_title="生产报工工资匹配计划单和订单分析工具",
     page_icon="🐾",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -211,10 +211,13 @@ def match_product_within_order(labor_key, order_id, sales_dict, threshold=75):
 
 
 # ============================================================
-# 5. 保存 Excel 并合并单元格，增加高亮预警
+# 5. 保存 Excel 并合并单元格，增加高亮预警（修复版）
 # ============================================================
-def save_with_merge_and_highlight(df, merge_cols, sum_cols, highlight_col, threshold=0.2):
-    """保存 DataFrame 为 Excel，合并指定列，并对 highlight_col 中大于 threshold 的单元格标红"""
+def save_with_merge_and_highlight(df, merge_cols, sum_cols, highlight_col, threshold=20.0):
+    """
+    保存 DataFrame 为 Excel，合并指定列，并对 highlight_col 中大于 threshold 的单元格标红。
+    修复版：正确解析百分比字符串（如 "20.23%"）并与数值阈值比较。
+    """
     buffer = io.BytesIO()
     df.to_excel(buffer, index=False, engine='openpyxl')
     buffer.seek(0)
@@ -222,10 +225,10 @@ def save_with_merge_and_highlight(df, merge_cols, sum_cols, highlight_col, thres
     wb = load_workbook(buffer)
     ws = wb.active
 
-    start_row = 2
+    start_row = 2          # 数据起始行（第1行是表头）
     total_rows = len(df) + 1
 
-    # 分组
+    # 按销售订单号分组
     groups = {}
     current_order = None
     group_start = start_row
@@ -241,10 +244,10 @@ def save_with_merge_and_highlight(df, merge_cols, sum_cols, highlight_col, thres
     red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 
     for order, (g_start, g_end) in groups.items():
-        if g_start == g_end:
+        if g_start == g_end:   # 单行订单无需合并
             continue
 
-        # 合并文本列
+        # 合并文本列（如“销售订单号”）
         for col_name in merge_cols:
             if col_name in df.columns:
                 col_idx = df.columns.get_loc(col_name) + 1
@@ -253,19 +256,38 @@ def save_with_merge_and_highlight(df, merge_cols, sum_cols, highlight_col, thres
                 cell = ws.cell(row=g_start, column=col_idx)
                 cell.alignment = Alignment(vertical='center')
 
-        # 合并汇总列
+        # 处理汇总列：合并并高亮（如果超过阈值）
         for col_name in sum_cols:
             if col_name in df.columns:
                 col_idx = df.columns.get_loc(col_name) + 1
+                # 合并该列在当前订单范围内的单元格
                 for r in range(g_start + 1, g_end + 1):
                     ws.cell(row=r, column=col_idx).value = None
                 ws.merge_cells(start_row=g_start, start_column=col_idx,
                                end_row=g_end, end_column=col_idx)
                 cell = ws.cell(row=g_start, column=col_idx)
                 cell.alignment = Alignment(vertical='center')
+
+                # ---------- 高亮逻辑（修复关键点）----------
                 if col_name == highlight_col:
-                    val = cell.value
-                    if isinstance(val, (int, float)) and val > threshold:
+                    val_str = cell.value
+                    numeric_val = 0.0
+
+                    # 将单元格内容转换为数值（支持百分比字符串、整数、浮点数）
+                    if isinstance(val_str, (int, float)):
+                        numeric_val = float(val_str)
+                    elif isinstance(val_str, str):
+                        # 移除百分号及周围空白
+                        cleaned = val_str.strip().replace('%', '')
+                        try:
+                            numeric_val = float(cleaned)
+                        except:
+                            numeric_val = 0.0
+                    else:
+                        numeric_val = 0.0
+
+                    # 超过阈值则填充红色（覆盖整个合并区域，醒目）
+                    if numeric_val > threshold:
                         for row in range(g_start, g_end + 1):
                             ws.cell(row=row, column=col_idx).fill = red_fill
 
@@ -279,7 +301,7 @@ def save_with_merge_and_highlight(df, merge_cols, sum_cols, highlight_col, thres
 # 6. 核心处理逻辑
 # ============================================================
 def process_data(sales_file, prod_file, labor_file, match_threshold=75, highlight_threshold=20.0):
-    """核心数据处理流程，返回处理结果和输出Excel字节流"""
+    """核心数据处理流程，返回结果DataFrame、输出Excel字节流、总工资、总销售额"""
 
     # ---------- 读取文件 ----------
     with st.status("读取销售订单表...", expanded=True) as status:
@@ -308,9 +330,6 @@ def process_data(sales_file, prod_file, labor_file, match_threshold=75, highligh
     col_qty_sales = find_column(df_sales, ['数量', '销售数量'], description="销售数量列")
     col_price = find_column(df_sales, ['本币含税单价', '单价', '销售单价', '含税单价'], description="销售单价列")
     col_amount = find_column(df_sales, ['本币含税金额', '金额', '销售金额', '总价', '含税金额'], description="销售金额列")
-
-    if col_amount and '本币含税金额' not in str(col_amount):
-        st.warning(f"匹配到的销售金额列为 '{col_amount}'，但未包含'本币含税金额'。请检查源表是否存在该列。")
 
     if not all([col_order_sales, col_product_sales, col_qty_sales, col_price, col_amount]):
         st.error("销售订单表缺少必要列，请检查文件后重新上传。")
@@ -413,9 +432,6 @@ def process_data(sales_file, prod_file, labor_file, match_threshold=75, highligh
     # ---------- 订单级汇总 ----------
     st.markdown('<div class="section-header">订单级汇总计算</div>', unsafe_allow_html=True)
 
-    with st.expander("调试信息：销售金额列数据预览", expanded=False):
-        st.dataframe(df_sales['销售金额'].head(5).to_frame(), use_container_width=True)
-
     order_sales_sum = df_sales.groupby('销售订单号').agg(
         按订单统计数量=('销售数量', 'sum'),
         按订单统计金额=('销售金额', 'sum')
@@ -489,6 +505,7 @@ def process_data(sales_file, prod_file, labor_file, match_threshold=75, highligh
         merged['销售数量'] = merged['销售数量'].fillna(0)
         merged['销售金额'] = merged['销售金额'].fillna(0)
         merged['销售单价'] = merged['销售单价'].fillna(0)
+        # 若销售金额为空但数量单价有值，计算补充
         merged['销售金额'] = merged.apply(
             lambda row: row['销售数量'] * row['销售单价']
             if row['销售金额'] == 0 and row['销售数量'] > 0
@@ -532,6 +549,7 @@ def process_data(sales_file, prod_file, labor_file, match_threshold=75, highligh
 
     # ---------- 生成 Excel ----------
     with st.spinner("正在生成 Excel 文件（含合并单元格和高亮预警）..."):
+        # 为了高亮判断，临时添加数值列（不导出）
         result['_temp_ratio'] = result['工资额占订单销售额比'].str.rstrip('%').astype(float)
         merge_cols = ['销售订单号']
         sum_cols = ['按订单统计数量', '按订单统计金额', '按订单统计生产工资额', '工资额占订单销售额比']
@@ -551,7 +569,7 @@ def process_data(sales_file, prod_file, labor_file, match_threshold=75, highligh
 # ============================================================
 def main():
     # ---------- 标题区域 ----------
-    st.title("宠物零食订单成本汇总工具")
+    st.title("生产工资与计划和订单汇总分析工具")
     st.caption("自动读取销售订单、生产指令单、车间报工台账，智能匹配产品并计算工资占比预警")
 
     st.markdown("---")
@@ -639,7 +657,6 @@ def main():
 
     if not all_files_ready:
         st.info("请上传全部三个文件后，点击下方按钮开始处理。")
-        # 显示文件上传状态
         uploaded = sum([1 for f in [sales_file, prod_file, labor_file] if f])
         st.progress(uploaded / 3, text=f"文件上传进度: {uploaded}/3")
 
@@ -703,7 +720,7 @@ def main():
                 st.download_button(
                     label="下载汇总结果 Excel（含合并单元格和红色预警高亮）",
                     data=excel_buffer,
-                    file_name="订单汇总统计结果(含百分比预警).xlsx",
+                    file_name="汇总统计分析结果(百分比预警).xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     type="primary",
                     use_container_width=True
