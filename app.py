@@ -1,6 +1,6 @@
 """
 生产报工工资匹配计划单和订单分析工具 (Streamlit 网页版)
-修复版：Excel 中工资占比超阈值的高亮红色现在会正确生效
+增强版：支持客户名称自动匹配 + 删除临时列
 """
 
 import streamlit as st
@@ -211,12 +211,12 @@ def match_product_within_order(labor_key, order_id, sales_dict, threshold=75):
 
 
 # ============================================================
-# 5. 保存 Excel 并合并单元格，增加高亮预警（修复版）
+# 5. 保存 Excel 并合并单元格，增加高亮预警（支持单行高亮）
 # ============================================================
 def save_with_merge_and_highlight(df, merge_cols, sum_cols, highlight_col, threshold=20.0):
     """
     保存 DataFrame 为 Excel，合并指定列，并对 highlight_col 中大于 threshold 的单元格标红。
-    修复版：正确解析百分比字符串（如 "20.23%"）并与数值阈值比较。
+    支持多行订单合并及单行订单高亮。
     """
     buffer = io.BytesIO()
     df.to_excel(buffer, index=False, engine='openpyxl')
@@ -244,52 +244,53 @@ def save_with_merge_and_highlight(df, merge_cols, sum_cols, highlight_col, thres
     red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 
     for order, (g_start, g_end) in groups.items():
-        if g_start == g_end:   # 单行订单无需合并
-            continue
+        # ---------- 合并操作（仅多行订单需要合并）----------
+        if g_start != g_end:
+            # 合并文本列（例如“销售订单号”及“客户名称”等）
+            for col_name in merge_cols:
+                if col_name in df.columns:
+                    col_idx = df.columns.get_loc(col_name) + 1
+                    ws.merge_cells(start_row=g_start, start_column=col_idx,
+                                   end_row=g_end, end_column=col_idx)
+                    cell = ws.cell(row=g_start, column=col_idx)
+                    cell.alignment = Alignment(vertical='center')
 
-        # 合并文本列（如“销售订单号”）
-        for col_name in merge_cols:
-            if col_name in df.columns:
-                col_idx = df.columns.get_loc(col_name) + 1
-                ws.merge_cells(start_row=g_start, start_column=col_idx,
-                               end_row=g_end, end_column=col_idx)
-                cell = ws.cell(row=g_start, column=col_idx)
-                cell.alignment = Alignment(vertical='center')
+            # 合并汇总列（数值列，需要保留合计值）
+            for col_name in sum_cols:
+                if col_name in df.columns:
+                    col_idx = df.columns.get_loc(col_name) + 1
+                    # 清除合并区域下方单元格的值
+                    for r in range(g_start + 1, g_end + 1):
+                        ws.cell(row=r, column=col_idx).value = None
+                    ws.merge_cells(start_row=g_start, start_column=col_idx,
+                                   end_row=g_end, end_column=col_idx)
+                    cell = ws.cell(row=g_start, column=col_idx)
+                    cell.alignment = Alignment(vertical='center')
 
-        # 处理汇总列：合并并高亮（如果超过阈值）
-        for col_name in sum_cols:
-            if col_name in df.columns:
-                col_idx = df.columns.get_loc(col_name) + 1
-                # 合并该列在当前订单范围内的单元格
-                for r in range(g_start + 1, g_end + 1):
-                    ws.cell(row=r, column=col_idx).value = None
-                ws.merge_cells(start_row=g_start, start_column=col_idx,
-                               end_row=g_end, end_column=col_idx)
-                cell = ws.cell(row=g_start, column=col_idx)
-                cell.alignment = Alignment(vertical='center')
+        # ---------- 高亮处理（所有订单：多行或单行都执行）----------
+        if highlight_col in df.columns:
+            col_idx = df.columns.get_loc(highlight_col) + 1
+            # 获取该订单对应高亮列的单元格（多行订单已合并，左上角单元格即为合并后单元格）
+            cell = ws.cell(row=g_start, column=col_idx)
+            val_str = cell.value
+            numeric_val = 0.0
 
-                # ---------- 高亮逻辑（修复关键点）----------
-                if col_name == highlight_col:
-                    val_str = cell.value
+            # 将单元格内容转换为数值（支持百分比字符串、数字）
+            if isinstance(val_str, (int, float)):
+                numeric_val = float(val_str)
+            elif isinstance(val_str, str):
+                cleaned = val_str.strip().replace('%', '')
+                try:
+                    numeric_val = float(cleaned)
+                except:
                     numeric_val = 0.0
+            else:
+                numeric_val = 0.0
 
-                    # 将单元格内容转换为数值（支持百分比字符串、整数、浮点数）
-                    if isinstance(val_str, (int, float)):
-                        numeric_val = float(val_str)
-                    elif isinstance(val_str, str):
-                        # 移除百分号及周围空白
-                        cleaned = val_str.strip().replace('%', '')
-                        try:
-                            numeric_val = float(cleaned)
-                        except:
-                            numeric_val = 0.0
-                    else:
-                        numeric_val = 0.0
-
-                    # 超过阈值则填充红色（覆盖整个合并区域，醒目）
-                    if numeric_val > threshold:
-                        for row in range(g_start, g_end + 1):
-                            ws.cell(row=row, column=col_idx).fill = red_fill
+            if numeric_val > threshold:
+                # 对整个订单区域（g_start 到 g_end）的所有行的高亮列填充红色
+                for row in range(g_start, g_end + 1):
+                    ws.cell(row=row, column=col_idx).fill = red_fill
 
     output_buffer = io.BytesIO()
     wb.save(output_buffer)
@@ -330,6 +331,7 @@ def process_data(sales_file, prod_file, labor_file, match_threshold=75, highligh
     col_qty_sales = find_column(df_sales, ['数量', '销售数量'], description="销售数量列")
     col_price = find_column(df_sales, ['本币含税单价', '单价', '销售单价', '含税单价'], description="销售单价列")
     col_amount = find_column(df_sales, ['本币含税金额', '金额', '销售金额', '总价', '含税金额'], description="销售金额列")
+    col_customer = find_column(df_sales, ['客户', '客户名称', '客户名', '客户简称'], description="客户名称列")
 
     if not all([col_order_sales, col_product_sales, col_qty_sales, col_price, col_amount]):
         st.error("销售订单表缺少必要列，请检查文件后重新上传。")
@@ -369,6 +371,8 @@ def process_data(sales_file, prod_file, labor_file, match_threshold=75, highligh
     }
     if spec_col_sales:
         rename_sales[spec_col_sales] = '规格型号'
+    if col_customer:
+        rename_sales[col_customer] = '客户名称'
     df_sales = df_sales.rename(columns=rename_sales)
 
     rename_prod = {
@@ -395,6 +399,11 @@ def process_data(sales_file, prod_file, labor_file, match_threshold=75, highligh
         if '规格型号' not in df.columns:
             df['规格型号'] = ''
 
+    # 如果销售表中没有客户名称列，则创建一个空列并给出提示
+    if '客户名称' not in df_sales.columns:
+        df_sales['客户名称'] = '未知'
+        st.info("销售订单表中未发现客户名称列，已自动填充为'未知'。")
+
     # ---------- 数据清洗 ----------
     st.markdown('<div class="section-header">数据清洗</div>', unsafe_allow_html=True)
 
@@ -403,6 +412,7 @@ def process_data(sales_file, prod_file, labor_file, match_threshold=75, highligh
             df['销售订单号'] = df['销售订单号'].apply(clean_order_id)
         df_sales['销售产品名'] = df_sales['销售产品名'].apply(clean_text)
         df_sales['规格型号'] = df_sales['规格型号'].apply(clean_text)
+        df_sales['客户名称'] = df_sales['客户名称'].apply(clean_text)
         df_prod['生产产品名'] = df_prod['生产产品名'].apply(clean_text)
         df_prod['规格型号'] = df_prod['规格型号'].apply(clean_text)
         df_labor['报工产品名'] = df_labor['报工产品名'].apply(clean_text)
@@ -428,6 +438,9 @@ def process_data(sales_file, prod_file, labor_file, match_threshold=75, highligh
     df_sales = df_sales[df_sales['销售订单号'] != '']
     df_prod = df_prod[df_prod['销售订单号'] != '']
     df_labor = df_labor[df_labor['销售订单号'] != '']
+
+    # ---------- 构建客户名称映射 ----------
+    customer_map = df_sales.groupby('销售订单号')['客户名称'].first().to_dict()
 
     # ---------- 订单级汇总 ----------
     st.markdown('<div class="section-header">订单级汇总计算</div>', unsafe_allow_html=True)
@@ -542,26 +555,42 @@ def process_data(sales_file, prod_file, labor_file, match_threshold=75, highligh
     ]
     result = merged[result_cols].copy()
     result.rename(columns={'薪资金额': '生产工资额'}, inplace=True)
+
+    # ---------- 插入客户名称列（位于“销售订单号”之后）----------
+    # 获取“销售订单号”列的索引位置
+    order_col_idx = result.columns.get_loc('销售订单号')
+    # 创建客户名称列
+    result.insert(order_col_idx + 1, '客户名称', result['销售订单号'].map(customer_map))
+    # 处理未匹配到的订单（理论上都应存在，若不存在则填充“未知”）
+    result['客户名称'] = result['客户名称'].fillna('未知')
+
+    # 重新排序列（可选，保证客户名称紧跟在订单号后）
+    # 已经通过 insert 实现了位置，无需额外操作
+
     result = result.sort_values(['销售订单号', '销售产品名', '规格型号']).reset_index(drop=True)
 
     total_wage = result['生产工资额'].sum()
     total_sales = result['按订单统计金额'].drop_duplicates().sum()
 
+    # ---------- 预警统计（需要临时数值列）----------
+    result['_temp_ratio'] = result['工资额占订单销售额比'].str.rstrip('%').astype(float)
+    warning_orders_df = result[result['_temp_ratio'] > highlight_threshold][['销售订单号', '客户名称', '销售产品名', '按订单统计金额', '按订单统计生产工资额', '工资额占订单销售额比']]
+    # 删除临时列（确保最终 Excel 中不包含该列）
+    result.drop(columns=['_temp_ratio'], inplace=True)
+
     # ---------- 生成 Excel ----------
     with st.spinner("正在生成 Excel 文件（含合并单元格和高亮预警）..."):
-        # 为了高亮判断，临时添加数值列（不导出）
-        result['_temp_ratio'] = result['工资额占订单销售额比'].str.rstrip('%').astype(float)
-        merge_cols = ['销售订单号']
+        merge_cols = ['销售订单号', '客户名称']   # 合并这两列
         sum_cols = ['按订单统计数量', '按订单统计金额', '按订单统计生产工资额', '工资额占订单销售额比']
         highlight_col = '工资额占订单销售额比'
         excel_buffer = save_with_merge_and_highlight(
             result, merge_cols, sum_cols, highlight_col, threshold=highlight_threshold
         )
-        result.drop(columns=['_temp_ratio'], inplace=True)
 
     st.success("Excel 文件生成完成！")
 
-    return result, excel_buffer, total_wage, total_sales
+    # 返回结果时，将预警订单信息也一同返回（供界面展示）
+    return result, excel_buffer, total_wage, total_sales, warning_orders_df
 
 
 # ============================================================
@@ -600,7 +629,7 @@ def main():
         st.header("使用说明")
         st.markdown("""
         **步骤 1**：上传三个 Excel 文件
-        - 销售订单台账
+        - 销售订单台账（需包含客户名称列）
         - 生产指令单台账
         - 车间报工台账
 
@@ -612,7 +641,8 @@ def main():
         - 系统会自动探测表头行
         - 支持报工表多工作表合并
         - 产品名称支持模糊匹配
-        - 工资占比超阈值会红色高亮
+        - 工资占比超阈值会红色高亮（包括单行订单）
+        - 输出 Excel 包含客户名称列，并自动合并相同订单的行
         """)
 
     # ---------- 文件上传区域 ----------
@@ -670,7 +700,7 @@ def main():
     # ---------- 执行处理 ----------
     if process_btn and all_files_ready:
         try:
-            result, excel_buffer, total_wage, total_sales = process_data(
+            result, excel_buffer, total_wage, total_sales, warning_orders_df = process_data(
                 sales_file, prod_file, labor_file,
                 match_threshold=match_threshold,
                 highlight_threshold=highlight_threshold
@@ -692,15 +722,11 @@ def main():
                     st.metric("平均工资占销售比", f"{avg_ratio:.2f}%")
 
                 # ---------- 预警订单 ----------
-                result['_temp_ratio'] = result['工资额占订单销售额比'].str.rstrip('%').astype(float)
-                warning_orders = result[result['_temp_ratio'] > highlight_threshold]
-                result.drop(columns=['_temp_ratio'], inplace=True)
-
-                if not warning_orders.empty:
-                    st.warning(f"发现 {warning_orders['销售订单号'].nunique()} 个订单的工资占比超过 {highlight_threshold}% 预警阈值！")
+                if not warning_orders_df.empty:
+                    st.warning(f"发现 {warning_orders_df['销售订单号'].nunique()} 个订单的工资占比超过 {highlight_threshold}% 预警阈值！")
                     with st.expander("查看预警订单详情", expanded=False):
                         st.dataframe(
-                            warning_orders[['销售订单号', '销售产品名', '按订单统计金额', '按订单统计生产工资额', '工资额占订单销售额比']],
+                            warning_orders_df,
                             use_container_width=True,
                             hide_index=True
                         )
@@ -718,9 +744,9 @@ def main():
                 st.markdown('<div class="section-header">下载结果</div>', unsafe_allow_html=True)
 
                 st.download_button(
-                    label="下载汇总结果 Excel（含合并单元格和红色预警高亮）",
+                    label="下载汇总结果 Excel（含客户名称、合并单元格和红色预警高亮）",
                     data=excel_buffer,
-                    file_name="汇总统计分析结果(百分比预警).xlsx",
+                    file_name="生产工资匹配订单汇总统计表.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     type="primary",
                     use_container_width=True
