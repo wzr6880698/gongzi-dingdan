@@ -1,6 +1,5 @@
 """
 生产报工工资匹配计划单和订单分析工具 (Streamlit 网页版)
-增强版：支持客户名称自动匹配 + 删除临时列
 """
 
 import streamlit as st
@@ -184,6 +183,39 @@ def find_column(df, keywords, allow_multiple=False, description="", strict_mode=
     return matches if allow_multiple else matches[0]
 
 
+def find_customer_column(df, description="客户名称列"):
+    """
+    智能识别客户名称列，避免匹配到“客户编码”等列。
+    策略：
+      1. 优先查找列名完全等于“客户”或“客户名称”的列
+      2. 其次查找列名包含“客户”且不包含“编码”、“code”的列
+      3. 最后回退到包含“客户”的第一个列
+    """
+    cols_lower = {col: str(col).lower() for col in df.columns}
+
+    # 1. 完全匹配
+    for col, col_lower in cols_lower.items():
+        if col_lower in ['客户', '客户名称', '客户名']:
+            st.info(f"识别到 {description}: `{col}` (完全匹配)")
+            return col
+
+    # 2. 包含“客户”但不含“编码”“code”
+    for col, col_lower in cols_lower.items():
+        if '客户' in col_lower:
+            if '编码' not in col_lower and 'code' not in col_lower:
+                st.info(f"识别到 {description}: `{col}` (包含'客户'且不含'编码')")
+                return col
+
+    # 3. 包含“客户”的任意列（最后手段）
+    for col, col_lower in cols_lower.items():
+        if '客户' in col_lower:
+            st.warning(f"识别到 {description}: `{col}` (可能包含编码信息，请确认)")
+            return col
+
+    st.warning(f"未找到 {description}，将填充默认值'未知'")
+    return None
+
+
 # ============================================================
 # 4. 订单内产品匹配
 # ============================================================
@@ -225,7 +257,7 @@ def save_with_merge_and_highlight(df, merge_cols, sum_cols, highlight_col, thres
     wb = load_workbook(buffer)
     ws = wb.active
 
-    start_row = 2          # 数据起始行（第1行是表头）
+    start_row = 2  # 数据起始行（第1行是表头）
     total_rows = len(df) + 1
 
     # 按销售订单号分组
@@ -325,17 +357,21 @@ def process_data(sales_file, prod_file, labor_file, match_threshold=75, highligh
     st.markdown('<div class="section-header">列名自动识别</div>', unsafe_allow_html=True)
 
     # 销售表列名
-    col_order_sales = find_column(df_sales, ['单据编号', '订单号', '订单编号', '销售订单', '单据号'], description="销售订单号列")
-    col_product_sales = find_column(df_sales, ['产品', '产品名称', '商品', '存货', '存货名称'], description="销售产品名列")
+    col_order_sales = find_column(df_sales, ['单据编号', '订单号', '订单编号', '销售订单', '单据号'],
+                                  description="销售订单号列")
+    col_product_sales = find_column(df_sales, ['产品', '产品名称', '商品', '存货', '存货名称'],
+                                    description="销售产品名列")
     col_spec_sales = find_column(df_sales, ['规格', '规格型号', '型号', '存货规格'], description="规格型号列")
     col_qty_sales = find_column(df_sales, ['数量', '销售数量'], description="销售数量列")
     col_price = find_column(df_sales, ['本币含税单价', '单价', '销售单价', '含税单价'], description="销售单价列")
-    col_amount = find_column(df_sales, ['本币含税金额', '金额', '销售金额', '总价', '含税金额'], description="销售金额列")
-    col_customer = find_column(df_sales, ['客户', '客户名称', '客户名', '客户简称'], description="客户名称列")
+    col_amount = find_column(df_sales, ['本币含税金额', '金额', '销售金额', '总价', '含税金额'],
+                             description="销售金额列")
+    # 使用智能函数识别客户名称列
+    col_customer = find_customer_column(df_sales, description="客户名称列")
 
     if not all([col_order_sales, col_product_sales, col_qty_sales, col_price, col_amount]):
         st.error("销售订单表缺少必要列，请检查文件后重新上传。")
-        return None, None
+        return None, None, None, None, None
     spec_col_sales = col_spec_sales if col_spec_sales else None
 
     # 生产指令单列名
@@ -346,11 +382,12 @@ def process_data(sales_file, prod_file, labor_file, match_threshold=75, highligh
 
     if not all([col_order_prod, col_product_prod, col_plan_qty]):
         st.error("生产指令单表缺少必要列，请检查文件后重新上传。")
-        return None, None
+        return None, None, None, None, None
     spec_col_prod = col_spec_prod if col_spec_prod else None
 
     # 报工表列名
-    col_order_labor = find_column(df_labor, ['订单号', '销售订单号', '订单编号', '所属销售订单'], description="报工订单号列")
+    col_order_labor = find_column(df_labor, ['订单号', '销售订单号', '订单编号', '所属销售订单'],
+                                  description="报工订单号列")
     col_product_labor = find_column(df_labor, ['产品名称', '生产产品', '产品', '存货'], description="报工产品名列")
     col_spec_labor = find_column(df_labor, ['规格', '规格型号', '型号', '产品规格'], description="报工规格列")
     col_actual_qty = find_column(df_labor, ['数量', '实际数量', '生产数量', '数量/工时'], description="实际数量列")
@@ -358,7 +395,7 @@ def process_data(sales_file, prod_file, labor_file, match_threshold=75, highligh
 
     if not all([col_order_labor, col_product_labor, col_actual_qty, col_wage_amount]):
         st.error("报工表缺少必要列，请检查文件后重新上传。")
-        return None, None
+        return None, None, None, None, None
     spec_col_labor = col_spec_labor if col_spec_labor else None
 
     # ---------- 统一列名 ----------
@@ -557,15 +594,9 @@ def process_data(sales_file, prod_file, labor_file, match_threshold=75, highligh
     result.rename(columns={'薪资金额': '生产工资额'}, inplace=True)
 
     # ---------- 插入客户名称列（位于“销售订单号”之后）----------
-    # 获取“销售订单号”列的索引位置
     order_col_idx = result.columns.get_loc('销售订单号')
-    # 创建客户名称列
     result.insert(order_col_idx + 1, '客户名称', result['销售订单号'].map(customer_map))
-    # 处理未匹配到的订单（理论上都应存在，若不存在则填充“未知”）
     result['客户名称'] = result['客户名称'].fillna('未知')
-
-    # 重新排序列（可选，保证客户名称紧跟在订单号后）
-    # 已经通过 insert 实现了位置，无需额外操作
 
     result = result.sort_values(['销售订单号', '销售产品名', '规格型号']).reset_index(drop=True)
 
@@ -574,13 +605,14 @@ def process_data(sales_file, prod_file, labor_file, match_threshold=75, highligh
 
     # ---------- 预警统计（需要临时数值列）----------
     result['_temp_ratio'] = result['工资额占订单销售额比'].str.rstrip('%').astype(float)
-    warning_orders_df = result[result['_temp_ratio'] > highlight_threshold][['销售订单号', '客户名称', '销售产品名', '按订单统计金额', '按订单统计生产工资额', '工资额占订单销售额比']]
+    warning_orders_df = result[result['_temp_ratio'] > highlight_threshold][
+        ['销售订单号', '客户名称', '销售产品名', '按订单统计金额', '按订单统计生产工资额', '工资额占订单销售额比']]
     # 删除临时列（确保最终 Excel 中不包含该列）
     result.drop(columns=['_temp_ratio'], inplace=True)
 
     # ---------- 生成 Excel ----------
     with st.spinner("正在生成 Excel 文件（含合并单元格和高亮预警）..."):
-        merge_cols = ['销售订单号', '客户名称']   # 合并这两列
+        merge_cols = ['销售订单号', '客户名称']  # 合并这两列
         sum_cols = ['按订单统计数量', '按订单统计金额', '按订单统计生产工资额', '工资额占订单销售额比']
         highlight_col = '工资额占订单销售额比'
         excel_buffer = save_with_merge_and_highlight(
@@ -589,7 +621,6 @@ def process_data(sales_file, prod_file, labor_file, match_threshold=75, highligh
 
     st.success("Excel 文件生成完成！")
 
-    # 返回结果时，将预警订单信息也一同返回（供界面展示）
     return result, excel_buffer, total_wage, total_sales, warning_orders_df
 
 
@@ -598,7 +629,7 @@ def process_data(sales_file, prod_file, labor_file, match_threshold=75, highligh
 # ============================================================
 def main():
     # ---------- 标题区域 ----------
-    st.title("生产工资与计划和订单汇总分析工具")
+    st.title("生产工资与计划和订单汇总统计分析工具")
     st.caption("自动读取销售订单、生产指令单、车间报工台账，智能匹配产品并计算工资占比预警")
 
     st.markdown("---")
@@ -643,6 +674,7 @@ def main():
         - 产品名称支持模糊匹配
         - 工资占比超阈值会红色高亮（包括单行订单）
         - 输出 Excel 包含客户名称列，并自动合并相同订单的行
+        - **客户名称优先匹配“客户”或“客户名称”列，避免误取“客户编码”**
         """)
 
     # ---------- 文件上传区域 ----------
@@ -723,7 +755,8 @@ def main():
 
                 # ---------- 预警订单 ----------
                 if not warning_orders_df.empty:
-                    st.warning(f"发现 {warning_orders_df['销售订单号'].nunique()} 个订单的工资占比超过 {highlight_threshold}% 预警阈值！")
+                    st.warning(
+                        f"发现 {warning_orders_df['销售订单号'].nunique()} 个订单的工资占比超过 {highlight_threshold}% 预警阈值！")
                     with st.expander("查看预警订单详情", expanded=False):
                         st.dataframe(
                             warning_orders_df,
